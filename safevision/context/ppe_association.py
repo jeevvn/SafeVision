@@ -54,9 +54,13 @@ class PPEAssociator:
     def __init__(self, config: Optional[PPEAssociationConfig] = None):
         self.config = config or PPEAssociationConfig()
         self.worker_ppe_states: Dict[int, WorkerPPEStatus] = {}
+        self._last_seen: Dict[int, int] = {}
+        self._tick = 0
 
     def reset(self):
         self.worker_ppe_states.clear()
+        self._last_seen.clear()
+        self._tick = 0
 
     def associate(self, workers: List[TrackedObject], ppe_detections: List[Dict]) -> Dict[int, WorkerPPEStatus]:
         """
@@ -67,12 +71,15 @@ class PPEAssociator:
         Returns:
             Dictionary mapping worker track_id -> WorkerPPEStatus
         """
-        current_worker_ids = {w.track_id for w in workers}
-        
-        # Purge stale workers from memory
-        stale_ids = [tid for tid in self.worker_ppe_states if tid not in current_worker_ids]
+        # FIX 3: forget a worker only after state_grace_frames of absence (not after a single missed frame)
+        self._tick += 1
+        for w in workers:
+            self._last_seen[w.track_id] = self._tick
+        stale_ids = [tid for tid, seen in self._last_seen.items()
+                     if self._tick - seen > self.config.state_grace_frames]
         for tid in stale_ids:
-            del self.worker_ppe_states[tid]
+            self._last_seen.pop(tid, None)
+            self.worker_ppe_states.pop(tid, None)
 
         # Initialize status for any newly appeared workers
         for w in workers:

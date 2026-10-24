@@ -28,6 +28,17 @@ class RiskEngineConfig:
     hysteresis_raise_frames: int = 3   # Consecutive frames required to escalate
     hysteresis_clear_frames: int = 5   # Consecutive frames below threshold to de-escalate
 
+    # FIX 3: keep a worker's temporal state for this many frames after they disappear
+    state_grace_frames: int = 15
+
+    # FIX 2: PPE can raise an alert on its own. R >= ppe_alert_scale * P_i once enough evidence exists.
+    # 0.6 * 0.6 (no helmet) = 0.36 -> WARNING.  Vest-only (0.4) = 0.24 -> no alert.  PPE alone never reaches CRITICAL.
+    ppe_alert_scale: float = 0.60
+    ppe_min_evidence_frames: int = 7   # frames of observation before PPE-only alerts are allowed
+
+    # FIX 1: the operator gate only silences machine-proximity terms, never the PPE term
+    gate_applies_to_ppe: bool = False
+
 
 @dataclass
 class DangerZoneConfig:
@@ -38,6 +49,7 @@ class DangerZoneConfig:
     velocity_expansion_factor: float = 2.5
     
     # Minimum speed threshold (pixels/frame) to trigger directional expansion
+    # (FIX 4: velocity is now a smoothed 6-frame regression, so jitter no longer crosses this)
     min_speed_threshold: float = 1.5
     
     # Fixed circular radius for Baseline comparison (in pixels)
@@ -61,6 +73,11 @@ class OperatorContextConfig:
     # Multiplier G_i(t) for pedestrian or uncertain
     pedestrian_multiplier: float = 1.0
 
+    # FIX 1: extra evidence required before someone is trusted to be the operator
+    min_cabin_frames: int = 3                    # consecutive frames inside the cabin region
+    min_inside_machine_ratio: float = 0.80       # worker box must sit inside the machine box
+    max_worker_machine_height_ratio: float = 0.65  # a seated driver is much shorter than the machine
+
 
 @dataclass
 class PPEAssociationConfig:
@@ -74,6 +91,9 @@ class PPEAssociationConfig:
     # Temporal voting window length (in frames)
     voting_window_frames: int = 7
     voting_positive_threshold: float = 0.50
+
+    # FIX 3: keep voting history this many frames after a worker disappears
+    state_grace_frames: int = 15
     
     # Penalty values for missing items
     penalty_missing_helmet: float = 0.60

@@ -143,4 +143,30 @@ class DualDetectorPipeline:
             elif cname in ('excavator', 'dump_truck', 'wheel_loader', 'crane', 'bulldozer', 'truck', 'machinery', 'car', 'bus', 'vehicle'):
                 machinery.append(d)
 
-        return workers, machinery, ppe_dets
+        # Also incorporate person detections from Model B (PPE detector) with IoU deduplication
+        pure_ppe_dets = []
+        for d in ppe_dets:
+            cname = d['class_name'].lower()
+            if cname in ('worker', 'person'):
+                box_d = d['bbox']
+                is_dup = False
+                for w in workers:
+                    box_w = w['bbox']
+                    ix1 = max(box_d[0], box_w[0])
+                    iy1 = max(box_d[1], box_w[1])
+                    ix2 = min(box_d[2], box_w[2])
+                    iy2 = min(box_d[3], box_w[3])
+                    iw = max(0.0, ix2 - ix1)
+                    ih = max(0.0, iy2 - iy1)
+                    inter = iw * ih
+                    if inter > 0:
+                        union = (box_d[2]-box_d[0])*(box_d[3]-box_d[1]) + (box_w[2]-box_w[0])*(box_w[3]-box_w[1]) - inter
+                        if union > 0 and (inter / union) >= 0.45:
+                            is_dup = True
+                            break
+                if not is_dup:
+                    workers.append(d)
+            else:
+                pure_ppe_dets.append(d)
+
+        return workers, machinery, pure_ppe_dets

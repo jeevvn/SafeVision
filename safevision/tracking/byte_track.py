@@ -4,6 +4,7 @@ Implements Kalman Filter state estimation, two-stage confidence matching,
 and velocity vector tracking for Workers and Machinery.
 """
 
+from collections import deque
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -38,13 +39,14 @@ class KalmanBoxTracker:
     Kalman Filter for single object bounding box [x1, y1, x2, y2].
     State vector: [cx, cy, s, r, vx, vy, vs], where s=area, r=aspect_ratio (w/h).
     """
-    count = 0
+    # FIX 6: no class-level ID counter. Each ByteTracker owns its own counter and passes the id in.
+    VELOCITY_WINDOW = 6        # frames of position history used for the velocity fit
+    VELOCITY_DEADBAND = 0.8    # px/frame below which a box is treated as stationary
 
-    def __init__(self, bbox: np.ndarray, class_name: str, score: float):
+    def __init__(self, bbox: np.ndarray, class_name: str, score: float, track_id: int):
         self.class_name = class_name
         self.score = score
-        self.id = KalmanBoxTracker.count + 1
-        KalmanBoxTracker.count += 1
+        self.id = track_id
 
         # State: [cx, cy, s, r, vx, vy, vs]
         w = max(1.0, bbox[2] - bbox[0])
@@ -81,6 +83,22 @@ class KalmanBoxTracker:
         self.state = TrackState.TENTATIVE
         self.history: List[np.ndarray] = [bbox.copy()]
         self.velocity: np.ndarray = np.array([0.0, 0.0])  # [vx, vy]
+        self._pos_hist = deque([(0, cx, cy)], maxlen=self.VELOCITY_WINDOW)
+
+    def _windowed_velocity(self) -> np.ndarray:
+        """FIX 4: least-squares slope over recent observed centres, EMA-smoothed, with a dead-band.
+        The raw Kalman velocity state reacts to every pixel of detector jitter."""
+        if len(self._pos_hist) < 3:
+            return np.zeros(2)
+        t = np.array([p[0] for p in self._pos_hist], dtype=float)
+        if t[-1] - t[0] < 2:
+            return np.zeros(2)
+        vx = np.polyfit(t, [p[1] for p in self._pos_hist], 1)[0]
+        vy = np.polyfit(t, [p[2] for p in self._pos_hist], 1)[0]
+        v = 0.6 * np.array([vx, vy]) + 0.4 * self.velocity
+        if np.linalg.norm(v) < self.VELOCITY_DEADBAND:
+            return np.zeros(2)
+        return v
 
     def predict(self) -> np.ndarray:
         """Advances state vector and returns predicted bounding box [x1, y1, x2, y2]."""
@@ -112,8 +130,9 @@ class KalmanBoxTracker:
         self.x += np.dot(K, y)
         self.P = np.dot(np.eye(7) - np.dot(K, self.H), self.P)
 
-        # Smooth velocity
-        self.velocity = self.x[4:6].copy()
+        # FIX 4: windowed, smoothed velocity instead of the raw (noisy) Kalman velocity state
+        self._pos_hist.append((self.age, cx, cy))
+        self.velocity = self._windowed_velocity()
         current_bbox = self.get_bbox()
         self.history.append(current_bbox)
         if len(self.history) > 60:
@@ -168,11 +187,12 @@ class ByteTracker:
         self.min_hits_to_confirm = min_hits_to_confirm
         self.trackers: List[KalmanBoxTracker] = []
         self.frame_count = 0
+        self._next_id = 1   # FIX 6: per-tracker counter
 
     def reset(self):
         self.trackers.clear()
         self.frame_count = 0
-        KalmanBoxTracker.count = 0
+        self._next_id = 1
 
     def update(self, detections: List[Dict]) -> List[TrackedObject]:
         """
@@ -247,8 +267,10 @@ class ByteTracker:
             new_tracker = KalmanBoxTracker(
                 bbox=np.array(det['bbox']),
                 class_name=det['class_name'],
-                score=det['score']
+                score=det['score'],
+                track_id=self._next_id
             )
+            self._next_id += 1
             self.trackers.append(new_tracker)
 
         # 6. Update track states and purge dead tracks

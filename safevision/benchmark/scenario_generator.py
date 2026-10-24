@@ -4,6 +4,7 @@ Synthesizes visual video frames and ground-truth interaction trajectories
 for evaluation, ablation experiments, and interactive demonstrations.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Generator, List, Tuple
 import numpy as np
@@ -247,3 +248,51 @@ class BenchmarkScenarioGenerator:
                 description="Worker walking briskly past perimeter. Hysteresis prevents 1-frame false alarms."
             ))
         return steps
+
+    def generate_real_dataset_sequence(self, dataset_name: str = "chv", num_frames: int = 20) -> List[ScenarioStep]:
+        """
+        Loads real construction site frames from local datasets (CHV or MOCS)
+        and packages them as scenario steps for real-time YOLO dual-detector inference.
+        """
+        import os
+        from safevision.data.dataset_loader import DatasetAuditor
+        auditor = DatasetAuditor()
+        steps = []
+
+        if dataset_name == "mocs":
+            target_dir = auditor.mocs_test_dir if os.path.exists(auditor.mocs_test_dir) else auditor.mocs_val_dir
+            if not os.path.exists(target_dir):
+                return self.generate_scenario_1_safe_operation(num_frames)
+            files = sorted([f for f in os.listdir(target_dir) if f.lower().endswith((".jpg", ".png", ".jpeg")) and not f.startswith("._")])[:num_frames]
+            for i, fname in enumerate(files):
+                fpath = os.path.join(target_dir, fname)
+                img = Image.open(fpath).convert("RGB")
+                steps.append(ScenarioStep(
+                    frame_idx=i + 1,
+                    image=img,
+                    worker_detections=None,
+                    machinery_detections=None,
+                    ppe_detections=None,
+                    ground_truth_event="MOCS_REAL_CLIP",
+                    description=f"Real MOCS Heavy Machinery Site Frame #{i+1} ({fname}). Live dual-detector YOLO inference."
+                ))
+        else:
+            # CHV dataset
+            if not os.path.exists(auditor.chv_images_dir):
+                return self.generate_scenario_1_safe_operation(num_frames)
+            for i in range(num_frames):
+                sample = auditor.load_chv_sample(i)
+                if sample:
+                    img, boxes = sample
+                    fname = getattr(img, "info", {}).get("filename", f"ppe_{i:04d}.jpg")
+                    steps.append(ScenarioStep(
+                        frame_idx=i + 1,
+                        image=img,
+                        worker_detections=None,
+                        machinery_detections=None,
+                        ppe_detections=None,
+                        ground_truth_event="CHV_REAL_CLIP",
+                        description=f"Real CHV Construction Worker Frame #{i+1} ({fname}). Live dual-detector YOLO inference."
+                    ))
+
+        return steps if steps else self.generate_scenario_1_safe_operation(num_frames)

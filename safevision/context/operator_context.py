@@ -21,72 +21,81 @@ class OperatorContextEstimator:
     """
     Evaluates worker-machinery spatial containment and relative kinematics
     to determine cabin operator state and context multiplier G_i(t).
+
+    FIX 1 - a worker is trusted to be the operator only if ALL of these hold:
+      * their box sits inside the machine box (not just overlapping the cabin zone in 2D)
+      * their box is much shorter than the machine (a seated driver, not a standing person)
+      * they stay in the cabin region for several consecutive frames
+      * they move WITH the machine (relative velocity small) - this check is never skipped,
+        even when the machine is parked.
+    Anything else is UNCERTAIN or PEDESTRIAN and keeps G = 1.0.
     """
-    def __init__(self, config: Optional[OperatorContextConfig] = None):
+    def __init__(self, config: Optional[OperatorContextConfig] = None, grace_frames: int = 15):
         self.config = config or OperatorContextConfig()
+        self.grace_frames = grace_frames
+        self._cabin_frames: Dict[int, int] = {}
+        self._last_seen: Dict[int, int] = {}
+        self._tick = 0
+
+    def reset(self):
+        self._cabin_frames.clear()
+        self._last_seen.clear()
+        self._tick = 0
+
+    def start_frame(self, worker_ids: List[int]):
+        """Call once per frame before evaluating workers; forgets workers gone for too long."""
+        self._tick += 1
+        for tid in worker_ids:
+            self._last_seen[tid] = self._tick
+        for tid in [t for t, seen in self._last_seen.items() if self._tick - seen > self.grace_frames]:
+            self._last_seen.pop(tid, None)
+            self._cabin_frames.pop(tid, None)
 
     def evaluate_operator_state(self, worker: TrackedObject,
                                 machinery: List[TrackedObject]) -> Tuple[OperatorState, float, Optional[int]]:
-        """
-        Evaluates worker against all active machines.
-        Returns:
-            (OperatorState, G_i(t) multiplier, host_machine_id or None)
-        """
-        w_box = worker.bbox  # [x1, y1, x2, y2]
+        cfg = self.config
+        w_box = worker.bbox
         w_area = max(1.0, (w_box[2] - w_box[0]) * (w_box[3] - w_box[1]))
-        w_center = worker.center
+        w_h = max(1.0, w_box[3] - w_box[1])
+
+        def inter(a, b):
+            return max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
 
         best_containment = 0.0
         best_machine_id = None
-        best_state = OperatorState.PEDESTRIAN
+        best_ok = False        # geometry + size checks passed for the best machine
+        best_rel_vel = float("inf")
 
         for m in machinery:
             m_box = m.bbox
             m_w = max(1.0, m_box[2] - m_box[0])
             m_h = max(1.0, m_box[3] - m_box[1])
+            rel_y1, rel_x1, rel_y2, rel_x2 = cfg.cabin_relative_box
+            cabin_box = np.array([m_box[0] + rel_x1 * m_w, m_box[1] + rel_y1 * m_h,
+                                  m_box[0] + rel_x2 * m_w, m_box[1] + rel_y2 * m_h])
 
-            # Expected cabin region: upper-middle portion of machine bounding box
-            rel_y1, rel_x1, rel_y2, rel_x2 = self.config.cabin_relative_box
-            cabin_box = np.array([
-                m_box[0] + rel_x1 * m_w,
-                m_box[1] + rel_y1 * m_h,
-                m_box[0] + rel_x2 * m_w,
-                m_box[1] + rel_y2 * m_h
-            ])
-
-            # Calculate intersection between worker box and cabin region
-            ix1 = max(w_box[0], cabin_box[0])
-            iy1 = max(w_box[1], cabin_box[1])
-            ix2 = min(w_box[2], cabin_box[2])
-            iy2 = min(w_box[3], cabin_box[3])
-            
-            inter_area = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-            containment_ratio = inter_area / w_area
-
-            # Relative velocity test: operator moves with the machine!
-            rel_vel = np.linalg.norm(worker.velocity - m.velocity)
-
-            if containment_ratio > best_containment:
-                best_containment = containment_ratio
+            containment = inter(w_box, cabin_box) / w_area
+            if containment > best_containment:
+                best_containment = containment
                 best_machine_id = m.track_id
+                inside_machine = inter(w_box, m_box) / w_area
+                best_ok = (containment >= cfg.cabin_containment_threshold
+                           and inside_machine >= cfg.min_inside_machine_ratio
+                           and (w_h / m_h) <= cfg.max_worker_machine_height_ratio)
+                best_rel_vel = float(np.linalg.norm(worker.velocity - m.velocity))
 
-                if containment_ratio >= self.config.cabin_containment_threshold:
-                    if rel_vel <= self.config.max_relative_velocity or m.speed < 1.0:
-                        best_state = OperatorState.CONFIRMED_OPERATOR
-                    else:
-                        best_state = OperatorState.UNCERTAIN
-                elif containment_ratio >= 0.25:
-                    best_state = OperatorState.UNCERTAIN
-                else:
-                    best_state = OperatorState.PEDESTRIAN
-
-        # Context multiplier G_i(t)
-        # Confirmed operator: suppressed (G_i = 0.0)
-        # Uncertain: conservative! (G_i = 1.0, NEVER gets automatic safe status)
-        # Pedestrian: standard alert (G_i = 1.0)
-        if best_state == OperatorState.CONFIRMED_OPERATOR:
-            multiplier = self.config.operator_multiplier
+        tid = worker.track_id
+        if best_ok:
+            self._cabin_frames[tid] = self._cabin_frames.get(tid, 0) + 1
         else:
-            multiplier = self.config.pedestrian_multiplier
+            self._cabin_frames[tid] = 0
 
-        return best_state, multiplier, best_machine_id
+        if best_ok and self._cabin_frames[tid] >= cfg.min_cabin_frames and best_rel_vel <= cfg.max_relative_velocity:
+            state = OperatorState.CONFIRMED_OPERATOR
+        elif best_containment >= 0.25:
+            state = OperatorState.UNCERTAIN       # conservative: never auto-safe
+        else:
+            state = OperatorState.PEDESTRIAN
+
+        multiplier = cfg.operator_multiplier if state == OperatorState.CONFIRMED_OPERATOR else cfg.pedestrian_multiplier
+        return state, multiplier, best_machine_id

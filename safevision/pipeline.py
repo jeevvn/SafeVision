@@ -52,7 +52,8 @@ class SafeVisionPipeline:
         )
         self.ppe_associator = PPEAssociator(config=self.config.ppe)
         self.danger_zone_mgr = DangerZoneManager(config=self.config.danger_zone)
-        self.operator_estimator = OperatorContextEstimator(config=self.config.operator)
+        self.operator_estimator = OperatorContextEstimator(config=self.config.operator,
+                                                           grace_frames=self.config.risk.state_grace_frames)
         self.risk_engine = RiskEngine(config=self.config.risk)
         self.logger = EventLogger(fps=30.0)
         self.annotator = VisualAnnotator(config=self.config)
@@ -64,6 +65,7 @@ class SafeVisionPipeline:
         self.tracker.reset()
         self.ppe_associator.reset()
         self.risk_engine.reset()
+        self.operator_estimator.reset()
         self.logger.reset()
         self.frame_idx = 0
 
@@ -102,6 +104,7 @@ class SafeVisionPipeline:
 
         # 5. Operator Context Estimation G_i(t)
         operator_states = {}
+        self.operator_estimator.start_frame([w.track_id for w in active_workers])
         for w in active_workers:
             if self.use_baseline:
                 # Baseline has NO cabin operator awareness! (Always pedestrian)

@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 from safevision.config import RiskEngineConfig
-from safevision.context.danger_zone import DangerZone, DangerZoneManager
+from safevision.context.danger_zone import DangerZone, DangerZoneManager, point_in_polygon, point_to_polygon_distance
 from safevision.context.operator_context import OperatorContextEstimator, OperatorState
 from safevision.context.ppe_association import WorkerPPEStatus
 from safevision.tracking.byte_track import TrackedObject
@@ -65,7 +65,13 @@ class RiskEngine:
         # Previous machine distances for relative approach velocity
         self.prev_distances: Dict[Tuple[int, int], float] = {}
 
+        # FIX 3: grace-period bookkeeping
+        self._last_seen: Dict[int, int] = {}
+        self._tick = 0
+
     def reset(self):
+        self._last_seen.clear()
+        self._tick = 0
         self.exposure_duration.clear()
         self.exposure_frame_count.clear()
         self.smoothed_scores.clear()
@@ -83,17 +89,18 @@ class RiskEngine:
         """
         Computes risk scores and alerts for all active workers in current frame.
         """
-        current_ids = {w.track_id for w in workers}
-        
-        # Clean up stale memory
-        for tid in list(self.exposure_duration.keys()):
-            if tid not in current_ids:
-                del self.exposure_duration[tid]
-                del self.exposure_frame_count[tid]
-                del self.smoothed_scores[tid]
-                del self.previous_levels[tid]
-                self.raise_counter.pop(tid, None)
-                self.clear_counter.pop(tid, None)
+        # FIX 3: keep a worker's temporal state through short dropouts; purge only after the grace period
+        self._tick += 1
+        for w in workers:
+            self._last_seen[w.track_id] = self._tick
+        stale = [tid for tid, seen in self._last_seen.items()
+                 if self._tick - seen > self.config.state_grace_frames]
+        for tid in stale:
+            for d in (self.exposure_duration, self.exposure_frame_count, self.smoothed_scores,
+                      self.previous_levels, self.raise_counter, self.clear_counter, self._last_seen):
+                d.pop(tid, None)
+            for key in [k for k in self.prev_distances if k[0] == tid]:
+                del self.prev_distances[key]
 
         results: Dict[int, WorkerRiskAssessment] = {}
 
@@ -103,34 +110,24 @@ class RiskEngine:
             w_bottom = (w_center[0], float(w.bbox[3]))
 
             # 1. Danger Zone Occupancy Z_i(t)
-            # Find best matching danger zone and proximity
+            # FIX 5: score the worker against EVERY zone and keep the highest. Ties (e.g. all zero)
+            # fall back to the nearest machine so M_i and distance still have a machine to refer to.
             Z_i = 0.0
             closest_machine_id = None
             min_dist_to_machine = float('inf')
 
             for dz in danger_zones:
                 dist_c = float(np.hypot(w_bottom[0] - dz.centroid[0], w_bottom[1] - dz.centroid[1]))
-                if dist_c < min_dist_to_machine:
-                    min_dist_to_machine = dist_c
+                d_edge = point_to_polygon_distance(w_bottom[0], w_bottom[1], dz.polygon)
+                if point_in_polygon(w_bottom[0], w_bottom[1], dz.polygon):
+                    z = min(1.0, 0.65 + 0.35 * (d_edge / 50.0))      # penetration: 0.65 .. 1.0
+                else:
+                    buffer_px = 120.0
+                    z = 0.50 * (1.0 - d_edge / buffer_px) if d_edge < buffer_px else 0.0
+                if z > Z_i or (z == Z_i and dist_c < min_dist_to_machine):
+                    Z_i = z
                     closest_machine_id = dz.machine_id
-
-            # Evaluate against danger zones
-            for dz in danger_zones:
-                if closest_machine_id == dz.machine_id:
-                    # Ray casting / penetration depth
-                    from safevision.context.danger_zone import point_in_polygon, point_to_polygon_distance
-                    if point_in_polygon(w_bottom[0], w_bottom[1], dz.polygon):
-                        # Penetration: 0.6 to 1.0 depending on depth
-                        d_edge = point_to_polygon_distance(w_bottom[0], w_bottom[1], dz.polygon)
-                        Z_i = min(1.0, 0.65 + 0.35 * (d_edge / 50.0))
-                    else:
-                        # Outside buffer
-                        d_edge = point_to_polygon_distance(w_bottom[0], w_bottom[1], dz.polygon)
-                        buffer_px = 120.0
-                        if d_edge < buffer_px:
-                            Z_i = 0.50 * (1.0 - (d_edge / buffer_px))
-                        else:
-                            Z_i = 0.0
+                    min_dist_to_machine = dist_c
 
             # 2. Observed Machinery Motion / Approach M_i(t)
             M_i = 0.0
@@ -185,14 +182,20 @@ class RiskEngine:
             )
 
             # 6. Combined Raw Risk Calculation: R_i(t)
-            weighted_sum = (
-                self.config.weight_danger_zone * Z_i +
-                self.config.weight_machine_motion * M_i +
-                self.config.weight_exposure_time * T_i +
-                self.config.weight_ppe_noncompliance * P_i
-            )
-            raw_R = float(G_i * weighted_sum)
-            raw_R = float(np.clip(raw_R, 0.0, 1.0))
+            # FIX 1: the operator gate silences machine-proximity terms only; PPE is always checked.
+            proximity = (self.config.weight_danger_zone * Z_i +
+                         self.config.weight_machine_motion * M_i +
+                         self.config.weight_exposure_time * T_i)
+            ppe_term = self.config.weight_ppe_noncompliance * P_i
+            if self.config.gate_applies_to_ppe:
+                weighted = G_i * (proximity + ppe_term)
+            else:
+                weighted = G_i * proximity + ppe_term
+            # FIX 2: PPE evidence can raise an alert by itself once enough frames were observed.
+            ppe_ready = (ppe_stat is not None and
+                         len(ppe_stat.helmet_history) >= self.config.ppe_min_evidence_frames)
+            ppe_floor = self.config.ppe_alert_scale * P_i if ppe_ready else 0.0
+            raw_R = float(np.clip(max(weighted, ppe_floor), 0.0, 1.0))
 
             # 7. Temporal Smoothing & Hysteresis
             prev_level = self.previous_levels.get(tid, RiskLevel.SAFE)
@@ -241,7 +244,7 @@ class RiskEngine:
             # 8. Human-Readable Explanation / Active Reasons
             reasons = []
             if op_state == OperatorState.CONFIRMED_OPERATOR:
-                reasons.append("Confirmed Cabin Operator (Alert Suppressed)")
+                reasons.append("Confirmed Cabin Operator (Proximity Alerts Suppressed)")
             elif op_state == OperatorState.UNCERTAIN:
                 reasons.append("Ambiguous Cabin State (Conservative Watch)")
 
