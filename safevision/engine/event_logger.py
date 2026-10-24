@@ -41,6 +41,11 @@ class EventLogger:
         self.events.clear()
         self._last_alert_level.clear()
 
+    @property
+    def event_records(self) -> List[SafetyEvent]:
+        """Alias for backward compatibility."""
+        return self.events
+
     def record_frame(self, frame_idx: int, assessments: Dict[int, WorkerRiskAssessment]):
         """
         Processes frame risk assessments and logs significant transitions
